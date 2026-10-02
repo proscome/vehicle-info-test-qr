@@ -798,7 +798,7 @@
 ></div>
 
 
-<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.4/dist/iife/reader/index.js"></script>
 <script>
 
 /* ==========================================
@@ -2527,7 +2527,7 @@ async function initialize() {
 
 
 /* ==========================================
-   車検証QR読み取り（5個全体を映して左から検出）
+   車検証QR読み取り（ZXing-C++ WebAssemblyで複数コードを検出）
    ========================================== */
 const qrScanButton = document.getElementById("qrScanButton");
 const qrScanPanel = document.getElementById("qrScanPanel");
@@ -2539,6 +2539,7 @@ const qrScanCancelButton = document.getElementById("qrScanCancelButton");
 let qrScanStream = null;
 let qrScanFrame = null;
 let qrLastFrameAt = 0;
+let qrDecodeBusy = false;
 let qrSeenTexts = new Map();
 
 function stopVehicleQrScan() {
@@ -2555,81 +2556,85 @@ function stopVehicleQrScan() {
   qrScanButton.disabled = false;
 }
 
-function decodeQrCrop(sx, sy, sw, sh, scale = 2) {
-  const w = Math.max(1, Math.round(sw * scale));
-  const h = Math.max(1, Math.round(sh * scale));
-  qrScanCanvas.width = w;
-  qrScanCanvas.height = h;
-  qrScanContext.imageSmoothingEnabled = false;
-  qrScanContext.drawImage(qrScanVideo, sx, sy, sw, sh, 0, 0, w, h);
-  const imageData = qrScanContext.getImageData(0, 0, w, h);
-  return jsQR(imageData.data, w, h, { inversionAttempts: "attemptBoth" });
+function qrResultCenterX(result) {
+  const p = result.position;
+  if (!p) return 0;
+  const pts = [p.topLeft, p.topRight, p.bottomLeft, p.bottomRight].filter(Boolean);
+  if (!pts.length) return 0;
+  return pts.reduce((sum, pt) => sum + pt.x, 0) / pts.length;
 }
 
-function scanVehicleQrFrame(timestamp) {
-  if (!qrScanStream || qrScanVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-    qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
+function qrModelFromFirstTwo(first, second) {
+  const firstParts = first.split("/");
+  const secondParts = second.split("/");
+  return ((firstParts[firstParts.length - 1] || "") + (secondParts[0] || "")).trim();
+}
+
+async function scanVehicleQrFrame(timestamp) {
+  if (!qrScanStream) return;
+  qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
+  if (qrDecodeBusy || timestamp - qrLastFrameAt < 350) return;
+  if (qrScanVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    qrScanStatus.textContent = "カメラ映像を待っています…";
     return;
   }
-  if (timestamp - qrLastFrameAt < 180) {
-    qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
-    return;
-  }
-  qrLastFrameAt = timestamp;
   const vw = qrScanVideo.videoWidth;
   const vh = qrScanVideo.videoHeight;
-  if (vw > 0 && vh > 0 && typeof jsQR === "function") {
-    // 画面全体を5つの縦帯に分け、それぞれを解析する。
-    // QRを1つずつ枠に入れる必要はなく、5個全体を映せばよい。
-    const found = new Map();
-    const bandW = vw / 5;
-    for (let i = 0; i < 5; i++) {
-      const sx = Math.max(0, Math.round(i * bandW - bandW * 0.08));
-      const ex = Math.min(vw, Math.round((i + 1) * bandW + bandW * 0.08));
-      const code = decodeQrCrop(sx, 0, ex - sx, vh, 2);
-      if (code && code.data) found.set(i, code.data);
-    }
-
-    // 一部のQRが帯の境界にある場合に備え、全体画像も補助的に解析する。
-    if (found.size === 0) {
-      const code = decodeQrCrop(0, 0, vw, vh, 1.5);
-      if (code && code.data) found.set(0, code.data);
-    }
-
-    if (found.size > 0) {
-      for (const [position, data] of found.entries()) {
-        if (!qrSeenTexts.has(position)) qrSeenTexts.set(position, data);
-      }
-      const count = qrSeenTexts.size;
-      qrScanStatus.textContent = `QRコードを解析中：${count}/5個を認識しました。車検証の5個全体を画面に映してください。`;
-
-      // 左から1個目・2個目のコードが得られたら型式を組み立てる。
-      if (qrSeenTexts.has(0) && qrSeenTexts.has(1)) {
-        const first = qrSeenTexts.get(0);
-        const second = qrSeenTexts.get(1);
-        const firstParts = first.split("/");
-        const secondParts = second.split("/");
-        const model = ((firstParts[firstParts.length - 1] || "") + (secondParts[0] || "")).trim();
-        if (model) {
-          modelInput.value = model;
-          modelInput.dispatchEvent(new Event("input", { bubbles: true }));
-          stopVehicleQrScan();
-          hideMessage();
-          modelInput.focus();
-          qrScanButton.textContent = "✓ QRから型式を読み取りました";
-          setTimeout(() => { qrScanButton.textContent = "車検証QRから型式を読み取る"; }, 2200);
-          return;
-        }
-      }
-    } else {
-      // 認識できていない場合も、0/5を含めて常に状況を表示する。
-      const count = qrSeenTexts.size;
-      qrScanStatus.textContent = `カメラ映像を解析中：${count}/5個を認識。まだ認識できていません。5個全体を明るく、ピントが合う距離で映してください。`;
-    }
-  } else {
-    qrScanStatus.textContent = `カメラ映像を待機中（映像サイズ ${vw}×${vh}）。`;
+  if (!vw || !vh) {
+    qrScanStatus.textContent = "カメラ映像のサイズを取得できません。";
+    return;
   }
-  qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
+  if (!window.ZXingWASM || typeof window.ZXingWASM.readBarcodes !== "function") {
+    qrScanStatus.textContent = "QR読み取りエンジンを読み込めません。通信状態を確認して再読み込みしてください。";
+    return;
+  }
+
+  qrDecodeBusy = true;
+  qrLastFrameAt = timestamp;
+  try {
+    // 映像全体を1枚の画像としてZXing-C++に渡し、複数QRの検出を依頼する。
+    qrScanCanvas.width = vw;
+    qrScanCanvas.height = vh;
+    qrScanContext.drawImage(qrScanVideo, 0, 0, vw, vh);
+    const imageData = qrScanContext.getImageData(0, 0, vw, vh);
+    const results = await window.ZXingWASM.readBarcodes(imageData, {
+      formats: ["QRCode"],
+      tryHarder: true,
+      maxNumberOfSymbols: 10,
+      tryRotate: true,
+      tryInvert: true
+    });
+    const sorted = (results || [])
+      .filter(r => r && r.text)
+      .sort((a, b) => qrResultCenterX(a) - qrResultCenterX(b));
+
+    // 各フレームで検出できた内容を画面に出し、検出が働いているか確認可能にする。
+    const uniqueTexts = [...new Set(sorted.map(r => r.text))];
+    qrScanStatus.textContent = uniqueTexts.length
+      ? `今回の映像で ${uniqueTexts.length} 個を検出しました（合計 ${Math.min(uniqueTexts.length, 5)}/5 個表示）。QR全体を映したままお待ちください。`
+      : `解析中：QRコードを検出できません（映像 ${vw}×${vh}）。5個全体を近づけ、ピントを合わせてください。`;
+
+    // 5個全体が映った1フレームで左から順に並べた結果を使う。
+    if (uniqueTexts.length >= 2) {
+      qrScanStatus.textContent = `QRコードを ${uniqueTexts.length} 個検出しました。左から1・2個目を使って型式を組み立てています…`;
+      const model = qrModelFromFirstTwo(uniqueTexts[0], uniqueTexts[1]);
+      if (model) {
+        modelInput.value = model;
+        modelInput.dispatchEvent(new Event("input", { bubbles: true }));
+        stopVehicleQrScan();
+        hideMessage();
+        modelInput.focus();
+        qrScanButton.textContent = "✓ QRから型式を読み取りました";
+        setTimeout(() => { qrScanButton.textContent = "車検証QRから型式を読み取る"; }, 2200);
+        return;
+      }
+    }
+  } catch (error) {
+    console.error("車検証QR解析エラー:", error);
+    qrScanStatus.textContent = `QR解析エラー：${error && error.message ? error.message : "詳細不明"}`;
+  } finally {
+    qrDecodeBusy = false;
+  }
 }
 
 async function startVehicleQrScan() {
@@ -2637,15 +2642,16 @@ async function startVehicleQrScan() {
     alert("このブラウザではカメラを利用できません。HTTPSで開いているか確認してください。");
     return;
   }
-  if (typeof jsQR !== "function") {
-    alert("QR読み取りライブラリを読み込めませんでした。通信状態を確認して再読み込みしてください。");
+  if (!window.ZXingWASM || typeof window.ZXingWASM.readBarcodes !== "function") {
+    alert("QR読み取りエンジンを読み込めませんでした。インターネット接続を確認してページを再読み込みしてください。");
     return;
   }
   qrSeenTexts = new Map();
   qrLastFrameAt = 0;
+  qrDecodeBusy = false;
   qrScanButton.disabled = true;
   qrScanPanel.classList.remove("hidden");
-  qrScanStatus.textContent = "カメラを起動しています。車検証の5個のQRコード全体を映してください。";
+  qrScanStatus.textContent = "カメラを起動しています。5つのQRコード全体を映してください。";
   try {
     qrScanStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
@@ -2653,7 +2659,7 @@ async function startVehicleQrScan() {
     });
     qrScanVideo.srcObject = qrScanStream;
     await qrScanVideo.play();
-    qrScanStatus.textContent = "解析中です。5個のQRコード全体を画面に映してください。";
+    qrScanStatus.textContent = "ZXing-C++で解析中です。5つのQRコード全体を画面に映してください。";
     qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
   } catch (error) {
     stopVehicleQrScan();
