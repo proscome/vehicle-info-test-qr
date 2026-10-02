@@ -2527,7 +2527,7 @@ async function initialize() {
 
 
 /* ==========================================
-   車検証QR読み取り（QR1・QR2を順番に読み取る）
+   車検証QR読み取り（5個全体を映して左から検出）
    ========================================== */
 const qrScanButton = document.getElementById("qrScanButton");
 const qrScanPanel = document.getElementById("qrScanPanel");
@@ -2538,11 +2538,8 @@ const qrScanContext = qrScanCanvas.getContext("2d", { willReadFrequently: true }
 const qrScanCancelButton = document.getElementById("qrScanCancelButton");
 let qrScanStream = null;
 let qrScanFrame = null;
-let qrFirstText = "";
-let qrLastText = "";
-let qrLastAcceptedAt = 0;
 let qrLastFrameAt = 0;
-let qrScanStep = 1;
+let qrSeenTexts = new Map();
 
 function stopVehicleQrScan() {
   if (qrScanFrame !== null) {
@@ -2558,17 +2555,15 @@ function stopVehicleQrScan() {
   qrScanButton.disabled = false;
 }
 
-function tryDecodeQr(sourceCanvas, sx, sy, sw, sh, scale = 2.5) {
+function decodeQrCrop(sx, sy, sw, sh, scale = 2) {
   const w = Math.max(1, Math.round(sw * scale));
   const h = Math.max(1, Math.round(sh * scale));
   qrScanCanvas.width = w;
   qrScanCanvas.height = h;
   qrScanContext.imageSmoothingEnabled = false;
-  qrScanContext.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, w, h);
+  qrScanContext.drawImage(qrScanVideo, sx, sy, sw, sh, 0, 0, w, h);
   const imageData = qrScanContext.getImageData(0, 0, w, h);
-  return jsQR(imageData.data, w, h, {
-    inversionAttempts: "attemptBoth"
-  });
+  return jsQR(imageData.data, w, h, { inversionAttempts: "attemptBoth" });
 }
 
 function scanVehicleQrFrame(timestamp) {
@@ -2576,81 +2571,61 @@ function scanVehicleQrFrame(timestamp) {
     qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
     return;
   }
-
-  // 1秒に約8回だけ解析して、iPhoneの負荷を抑える
-  if (timestamp - qrLastFrameAt < 125) {
+  if (timestamp - qrLastFrameAt < 180) {
     qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
     return;
   }
   qrLastFrameAt = timestamp;
-
   const vw = qrScanVideo.videoWidth;
   const vh = qrScanVideo.videoHeight;
   if (vw > 0 && vh > 0 && typeof jsQR === "function") {
-    // カメラ映像の中央を大きく切り出して拡大する。
-    // 「緑の枠」にQRを入れると、小さなQRでも認識しやすくする。
-    const cropW = Math.round(vw * 0.55);
-    const cropH = Math.round(vh * 0.70);
-    const sx = Math.round((vw - cropW) / 2);
-    const sy = Math.round((vh - cropH) / 2);
-
-    // まず中央の拡大画像を解析
-    let code = tryDecodeQr(qrScanVideo, sx, sy, cropW, cropH, 2.5);
-
-    // 失敗した場合は全体も解析（QRが枠から少し外れていても拾えるようにする）
-    if (!code) {
-      code = tryDecodeQr(qrScanVideo, 0, 0, vw, vh, 1.25);
+    // 画面全体を5つの縦帯に分け、それぞれを解析する。
+    // QRを1つずつ枠に入れる必要はなく、5個全体を映せばよい。
+    const found = new Map();
+    const bandW = vw / 5;
+    for (let i = 0; i < 5; i++) {
+      const sx = Math.max(0, Math.round(i * bandW - bandW * 0.08));
+      const ex = Math.min(vw, Math.round((i + 1) * bandW + bandW * 0.08));
+      const code = decodeQrCrop(sx, 0, ex - sx, vh, 2);
+      if (code && code.data) found.set(i, code.data);
     }
 
-    if (code && code.data) {
-      const now = Date.now();
-      if (code.data !== qrLastText && now - qrLastAcceptedAt > 700) {
-        qrLastText = code.data;
-        qrLastAcceptedAt = now;
-        acceptVehicleQrText(code.data);
-        if (!qrScanStream) return;
+    // 一部のQRが帯の境界にある場合に備え、全体画像も補助的に解析する。
+    if (found.size === 0) {
+      const code = decodeQrCrop(0, 0, vw, vh, 1.5);
+      if (code && code.data) found.set(0, code.data);
+    }
+
+    if (found.size > 0) {
+      for (const [position, data] of found.entries()) {
+        if (!qrSeenTexts.has(position)) qrSeenTexts.set(position, data);
       }
+      const count = qrSeenTexts.size;
+      qrScanStatus.textContent = `QRコードを解析中：${count}/5個を認識しました。車検証の5個全体を画面に映してください。`;
+
+      // 左から1個目・2個目のコードが得られたら型式を組み立てる。
+      if (qrSeenTexts.has(0) && qrSeenTexts.has(1)) {
+        const first = qrSeenTexts.get(0);
+        const second = qrSeenTexts.get(1);
+        const firstParts = first.split("/");
+        const secondParts = second.split("/");
+        const model = ((firstParts[firstParts.length - 1] || "") + (secondParts[0] || "")).trim();
+        if (model) {
+          modelInput.value = model;
+          modelInput.dispatchEvent(new Event("input", { bubbles: true }));
+          stopVehicleQrScan();
+          hideMessage();
+          modelInput.focus();
+          qrScanButton.textContent = "✓ QRから型式を読み取りました";
+          setTimeout(() => { qrScanButton.textContent = "車検証QRから型式を読み取る"; }, 2200);
+          return;
+        }
+      }
+    } else {
+      qrScanStatus.textContent = "解析中です。5個のQRコード全体が画面に入るよう、少し離して映してください。";
     }
   }
-
   qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
-}
-
-function acceptVehicleQrText(text) {
-  if (qrScanStep === 1) {
-    qrFirstText = text;
-    qrScanStep = 2;
-    qrLastText = text;
-    qrScanStatus.innerHTML = '<span class="qr-scan-success">✓ 1個目を読み取りました</span><br>続いて、車検証の左から2番目のQRコードを緑の枠に入れてください。';
-    return;
-  }
-
-  if (text === qrFirstText) return;
-
-  const firstParts = qrFirstText.split("/");
-  const secondParts = text.split("/");
-  const firstTail = firstParts[firstParts.length - 1] || "";
-  const secondHead = secondParts[0] || "";
-  const model = (firstTail + secondHead).trim();
-
-  if (!firstTail || !secondHead || !model) {
-    qrScanStatus.textContent = "QRコードの内容から型式を組み立てられませんでした。もう一度、2個のQRコードを読み取ってください。";
-    qrLastText = "";
-    return;
-  }
-
-  modelInput.value = model;
-  modelInput.dispatchEvent(new Event("input", { bubbles: true }));
-  stopVehicleQrScan();
-  hideMessage();
-  modelInput.focus();
-
-  // 読み取り完了を画面上でも明確にする
-  qrScanButton.disabled = false;
-  qrScanButton.textContent = "✓ QRから型式を読み取りました";
-  setTimeout(() => {
-    qrScanButton.textContent = "車検証QRから型式を読み取る";
-  }, 2200);
 }
 
 async function startVehicleQrScan() {
@@ -2662,28 +2637,19 @@ async function startVehicleQrScan() {
     alert("QR読み取りライブラリを読み込めませんでした。通信状態を確認して再読み込みしてください。");
     return;
   }
-
-  qrFirstText = "";
-  qrLastText = "";
-  qrLastAcceptedAt = 0;
+  qrSeenTexts = new Map();
   qrLastFrameAt = 0;
-  qrScanStep = 1;
   qrScanButton.disabled = true;
   qrScanPanel.classList.remove("hidden");
-  qrScanStatus.textContent = "車検証の左端（1個目）のQRコードを緑の枠に入れてください。自動で読み取ります。";
-
+  qrScanStatus.textContent = "カメラを起動しています。車検証の5個のQRコード全体を映してください。";
   try {
     qrScanStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 }
-      },
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
       audio: false
     });
-
     qrScanVideo.srcObject = qrScanStream;
     await qrScanVideo.play();
+    qrScanStatus.textContent = "解析中です。5個のQRコード全体を画面に映してください。";
     qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
   } catch (error) {
     stopVehicleQrScan();
