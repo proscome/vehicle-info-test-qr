@@ -441,19 +441,57 @@
       border-radius: 12px;
       background: #fff;
     }
+    .qr-video-wrap {
+      position: relative;
+      margin-top: 10px;
+      overflow: hidden;
+      border-radius: 10px;
+      background: #111827;
+    }
     .qr-scan-panel video {
       display: block;
       width: 100%;
-      max-height: 320px;
-      margin-top: 10px;
-      border-radius: 8px;
+      max-height: 420px;
+      min-height: 260px;
+      border-radius: 10px;
       background: #111827;
-      object-fit: contain;
+      object-fit: cover;
+    }
+    .qr-target {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: min(62vw, 280px);
+      height: min(62vw, 280px);
+      transform: translate(-50%, -50%);
+      border: 3px solid #22c55e;
+      border-radius: 16px;
+      box-shadow: 0 0 0 9999px rgba(0,0,0,.20);
+      pointer-events: none;
+    }
+    .qr-target::after {
+      content: "";
+      position: absolute;
+      left: 8%;
+      right: 8%;
+      top: 50%;
+      height: 3px;
+      background: #22c55e;
+      box-shadow: 0 0 8px rgba(34,197,94,.9);
+      animation: qrScanLine 1.7s ease-in-out infinite;
+    }
+    @keyframes qrScanLine {
+      0%,100% { transform: translateY(-90px); opacity: .45; }
+      50% { transform: translateY(90px); opacity: 1; }
     }
     .qr-scan-status {
       margin-top: 8px;
       line-height: 1.6;
       font-size: 0.95rem;
+    }
+    .qr-scan-success {
+      color: #15803d;
+      font-weight: 700;
     }
 
   </style>
@@ -645,7 +683,10 @@
           <div id="qrScanStatus" class="qr-scan-status" aria-live="polite">
             カメラを準備しています。
           </div>
-          <video id="qrScanVideo" playsinline muted></video>
+          <div class="qr-video-wrap">
+            <video id="qrScanVideo" playsinline muted></video>
+            <div class="qr-target" aria-hidden="true"></div>
+          </div>
           <canvas id="qrScanCanvas" class="hidden"></canvas>
           <button id="qrScanCancelButton" class="secondary-btn" type="button">読み取りを中止</button>
         </div>
@@ -2499,8 +2540,8 @@ let qrScanStream = null;
 let qrScanFrame = null;
 let qrFirstText = "";
 let qrLastText = "";
-let qrSameTextFrames = 0;
 let qrLastAcceptedAt = 0;
+let qrLastFrameAt = 0;
 let qrScanStep = 1;
 
 function stopVehicleQrScan() {
@@ -2517,29 +2558,61 @@ function stopVehicleQrScan() {
   qrScanButton.disabled = false;
 }
 
-function scanVehicleQrFrame() {
+function tryDecodeQr(sourceCanvas, sx, sy, sw, sh, scale = 2.5) {
+  const w = Math.max(1, Math.round(sw * scale));
+  const h = Math.max(1, Math.round(sh * scale));
+  qrScanCanvas.width = w;
+  qrScanCanvas.height = h;
+  qrScanContext.imageSmoothingEnabled = false;
+  qrScanContext.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, w, h);
+  const imageData = qrScanContext.getImageData(0, 0, w, h);
+  return jsQR(imageData.data, w, h, {
+    inversionAttempts: "attemptBoth"
+  });
+}
+
+function scanVehicleQrFrame(timestamp) {
   if (!qrScanStream || qrScanVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
     qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
     return;
   }
-  if (qrScanVideo.videoWidth > 0 && qrScanVideo.videoHeight > 0) {
-    qrScanCanvas.width = qrScanVideo.videoWidth;
-    qrScanCanvas.height = qrScanVideo.videoHeight;
-    qrScanContext.drawImage(qrScanVideo, 0, 0, qrScanCanvas.width, qrScanCanvas.height);
-    if (typeof jsQR === "function") {
-      const imageData = qrScanContext.getImageData(0, 0, qrScanCanvas.width, qrScanCanvas.height);
-      const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "attemptBoth" });
-      if (code && code.data && code.data !== qrLastText) {
-        const now = Date.now();
-        if (now - qrLastAcceptedAt > 900) {
-          qrLastText = code.data;
-          qrLastAcceptedAt = now;
-          acceptVehicleQrText(code.data);
-          if (!qrScanStream) return;
-        }
+
+  // 1秒に約8回だけ解析して、iPhoneの負荷を抑える
+  if (timestamp - qrLastFrameAt < 125) {
+    qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
+    return;
+  }
+  qrLastFrameAt = timestamp;
+
+  const vw = qrScanVideo.videoWidth;
+  const vh = qrScanVideo.videoHeight;
+  if (vw > 0 && vh > 0 && typeof jsQR === "function") {
+    // カメラ映像の中央を大きく切り出して拡大する。
+    // 「緑の枠」にQRを入れると、小さなQRでも認識しやすくする。
+    const cropW = Math.round(vw * 0.55);
+    const cropH = Math.round(vh * 0.70);
+    const sx = Math.round((vw - cropW) / 2);
+    const sy = Math.round((vh - cropH) / 2);
+
+    // まず中央の拡大画像を解析
+    let code = tryDecodeQr(qrScanVideo, sx, sy, cropW, cropH, 2.5);
+
+    // 失敗した場合は全体も解析（QRが枠から少し外れていても拾えるようにする）
+    if (!code) {
+      code = tryDecodeQr(qrScanVideo, 0, 0, vw, vh, 1.25);
+    }
+
+    if (code && code.data) {
+      const now = Date.now();
+      if (code.data !== qrLastText && now - qrLastAcceptedAt > 700) {
+        qrLastText = code.data;
+        qrLastAcceptedAt = now;
+        acceptVehicleQrText(code.data);
+        if (!qrScanStream) return;
       }
     }
   }
+
   qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
 }
 
@@ -2548,25 +2621,36 @@ function acceptVehicleQrText(text) {
     qrFirstText = text;
     qrScanStep = 2;
     qrLastText = text;
-    qrScanStatus.textContent = "1個目を読み取りました。カメラを車検証の左から2番目のQRコードに向けてください。";
+    qrScanStatus.innerHTML = '<span class="qr-scan-success">✓ 1個目を読み取りました</span><br>続いて、車検証の左から2番目のQRコードを緑の枠に入れてください。';
     return;
   }
+
   if (text === qrFirstText) return;
+
   const firstParts = qrFirstText.split("/");
   const secondParts = text.split("/");
   const firstTail = firstParts[firstParts.length - 1] || "";
   const secondHead = secondParts[0] || "";
   const model = (firstTail + secondHead).trim();
+
   if (!firstTail || !secondHead || !model) {
-    qrScanStatus.textContent = "QRコードの内容から型式を組み立てられませんでした。読み取りを中止して、手入力してください。";
+    qrScanStatus.textContent = "QRコードの内容から型式を組み立てられませんでした。もう一度、2個のQRコードを読み取ってください。";
+    qrLastText = "";
     return;
   }
+
   modelInput.value = model;
   modelInput.dispatchEvent(new Event("input", { bubbles: true }));
   stopVehicleQrScan();
   hideMessage();
-  qrScanStatus.textContent = "型式を入力欄にセットしました。内容を確認してから「検索」を押してください。";
   modelInput.focus();
+
+  // 読み取り完了を画面上でも明確にする
+  qrScanButton.disabled = false;
+  qrScanButton.textContent = "✓ QRから型式を読み取りました";
+  setTimeout(() => {
+    qrScanButton.textContent = "車検証QRから型式を読み取る";
+  }, 2200);
 }
 
 async function startVehicleQrScan() {
@@ -2578,20 +2662,29 @@ async function startVehicleQrScan() {
     alert("QR読み取りライブラリを読み込めませんでした。通信状態を確認して再読み込みしてください。");
     return;
   }
+
   qrFirstText = "";
   qrLastText = "";
   qrLastAcceptedAt = 0;
+  qrLastFrameAt = 0;
   qrScanStep = 1;
   qrScanButton.disabled = true;
   qrScanPanel.classList.remove("hidden");
-  qrScanStatus.textContent = "車検証の左端（1個目）のQRコードをカメラに映してください。カメラの使用を許可してください。";
+  qrScanStatus.textContent = "車検証の左端（1個目）のQRコードを緑の枠に入れてください。自動で読み取ります。";
+
   try {
     qrScanStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" } }, audio: false
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
     });
+
     qrScanVideo.srcObject = qrScanStream;
     await qrScanVideo.play();
-    scanVehicleQrFrame();
+    qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
   } catch (error) {
     stopVehicleQrScan();
     alert("カメラを起動できませんでした。ブラウザのカメラ使用許可を確認してください。");
@@ -2600,7 +2693,6 @@ async function startVehicleQrScan() {
 
 qrScanButton.addEventListener("click", startVehicleQrScan);
 qrScanCancelButton.addEventListener("click", stopVehicleQrScan);
-
 
 initialize();
 
