@@ -2622,8 +2622,12 @@ function scanVehicleQrFrame(timestamp) {
         }
       }
     } else {
-      qrScanStatus.textContent = "解析中です。5個のQRコード全体が画面に入るよう、少し離して映してください。";
+      // 認識できていない場合も、0/5を含めて常に状況を表示する。
+      const count = qrSeenTexts.size;
+      qrScanStatus.textContent = `カメラ映像を解析中：${count}/5個を認識。まだ認識できていません。5個全体を明るく、ピントが合う距離で映してください。`;
     }
+  } else {
+    qrScanStatus.textContent = `カメラ映像を待機中（映像サイズ ${vw}×${vh}）。`;
   }
   qrScanFrame = requestAnimationFrame(scanVehicleQrFrame);
 }
